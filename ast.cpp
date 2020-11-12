@@ -6,11 +6,19 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include <algorithm>
+#include <cassert>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -18,13 +26,16 @@
 #include <string>
 #include <vector>
 #include "main.cpp"
+#include "KaleidoscopeJIT.h"
 
 
 
-static std::unique_ptr<llvm::LLVMContext> TheContext;
+static llvm::LLVMContext TheContext;
+static llvm::IRBuilder<> Builder(TheContext);
 static std::unique_ptr<llvm::Module> TheModule;
-static std::unique_ptr<llvm::IRBuilder<>> Builder;
+static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
 static std::map<std::string, llvm::Value *> NamedValues;
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
 
 llvm::Value *LogErrorV(const char *Str) {
   LogErrorV(Str);
@@ -45,7 +56,7 @@ public:
 };
 
 llvm::Value *NumberExprAST::codegen() {
-  return llvm::ConstantFP::get(*TheContext, llvm::APFloat(val));
+  return llvm::ConstantFP::get(TheContext, llvm::APFloat(val));
 }
 
 class VariableExprAST : public ExprAST {
@@ -82,18 +93,18 @@ llvm::Value *BinaryExprAST::codegen() {
   switch (op)
   {
   case '+':
-    return Builder->CreateFAdd(L, R, "addtmp");
+    return Builder.CreateFAdd(L, R, "addtmp");
     break;
   case '-':
-    return Builder->CreateFSub(L, R, "subtmp");
+    return Builder.CreateFSub(L, R, "subtmp");
     break;
   case '*':
-    return Builder->CreateFMul(L, R, "multmp");
+    return Builder.CreateFMul(L, R, "multmp");
     break;
   case '<':
-    L = Builder->CreateFCmpULT(L, R, "cmptmp");
+    L = Builder.CreateFCmpULT(L, R, "cmptmp");
     // Convert bool 0/1 to double 0.0 or 1.0
-    return Builder->CreateUIToFP(L, llvm::Type::getDoubleTy(*TheContext), "booltmp");
+    return Builder.CreateUIToFP(L, llvm::Type::getDoubleTy(TheContext), "booltmp");
   default:
     return LogErrorV("invalid binary operator");
   }
@@ -124,7 +135,7 @@ llvm::Value *CallExprAST::codegen() {
         return nullptr;
   }
 
-  return Builder->CreateCall(CalleeF, ArgsV, "calltemp");
+  return Builder.CreateCall(CalleeF, ArgsV, "calltemp");
 }
 
 
@@ -141,9 +152,9 @@ public:
 llvm::Function *PrototypeAST::codegen() {
   // Make the function type: double(double, double) etc.
 
-  std::vector<llvm::Type*> Doubles(args.size(), llvm::Type::getDoubleTy(*TheContext));
+  std::vector<llvm::Type*> Doubles(args.size(), llvm::Type::getDoubleTy(TheContext));
 
-  llvm::FunctionType *FT = llvm::FunctionType::get(llvm::Type::getDoubleTy(*TheContext), Doubles, false);
+  llvm::FunctionType *FT = llvm::FunctionType::get(llvm::Type::getDoubleTy(TheContext), Doubles, false);
   llvm::Function *F = llvm::Function::Create(FT, llvm::Function::ExternalLinkage, name, TheModule.get());
 
   // Set names for all arguments
@@ -176,8 +187,8 @@ llvm::Function *FunctionAST::codegen() {
     return (llvm::Function*) LogErrorV("Function cannot be redefined");
 
   // Create a new basic block to start insertion into.
-  llvm::BasicBlock *BB = llvm::BasicBlock::Create(*TheContext, "entry", theFunction);
-  Builder->SetInsertPoint(BB);
+  llvm::BasicBlock *BB = llvm::BasicBlock::Create(TheContext, "entry", theFunction);
+  Builder.SetInsertPoint(BB);
 
   // Record the function arguments in the Named Values map.
   NamedValues.clear();
@@ -186,10 +197,12 @@ llvm::Function *FunctionAST::codegen() {
 
   if (llvm::Value *RetVal = body->codegen()) {
     // finish off the function
-    Builder->CreateRet(RetVal);
+    Builder.CreateRet(RetVal);
 
     //validate the generated code, checking for consistency.
     llvm::verifyFunction(*theFunction);
+
+    TheFPM->run(*theFunction);
 
     return theFunction;
   }
@@ -384,7 +397,7 @@ static std::unique_ptr<PrototypeAST> ParseExtern() {
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
   if (auto E = ParseExpression()) {
     // Make an anonymouse proto.
-    auto Proto = std::make_unique<PrototypeAST>("", std::vector<std::string>());
+    auto Proto = std::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
     return std::make_unique<FunctionAST>(std::move(Proto), std::move(E));
   }
   return nullptr;
@@ -393,13 +406,29 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 // Top-Level Parsing
 
 
-static void InitializeModule() {
-  // Open a new context and module.
-  TheContext = std::make_unique<llvm::LLVMContext>();
-  TheModule = std::make_unique<llvm::Module>("JIFF", *TheContext);
+static void InitializeModuleAndPassManager() {
+  fprintf(stderr, "Text 3 \n");
 
-  // Create a new builder for the module.
-  Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+
+  // Open a new module
+  TheModule = std::make_unique<llvm::Module>("JIFF", TheContext);
+  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
+
+
+  // Create a new pass manager attached to it
+  TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
+
+  // Do simple "peephole" optimizations and bit-twiddling optzns.
+  TheFPM->add(llvm::createInstructionCombiningPass());
+  // Reassociate expressions.
+  TheFPM->add(llvm::createReassociatePass());
+  // Eliminate Common SubExpressions.
+  TheFPM->add(llvm::createGVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM->add(llvm::createCFGSimplificationPass());
+
+  TheFPM->doInitialization();
+
 }
 
 //
@@ -410,6 +439,8 @@ static void HandleDefinition() {
     if (auto *FnIR = FnAST->codegen()) {
       FnIR->print(llvm::errs());
       fprintf(stderr, "\n");
+      TheJIT->addModule(std::move(TheModule));
+      InitializeModuleAndPassManager();
     }
   } else {
     // Skip token for error recovery
@@ -434,12 +465,30 @@ static void HandleTopLevelExpression() {
   if (auto FnAST = ParseTopLevelExpr()) {
     fprintf(stderr, "Parsed a top-level expr \n");
     if (auto *FnIR = FnAST->codegen()) {
+
+      // JIT the module containing the anonymous expression, keeping a handle so
+      // we can free it later.
+      auto H = TheJIT->addModule(std::move(TheModule));
+      InitializeModuleAndPassManager();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
+      assert(ExprSymbol && "Function not found");
+
+      // Get the symbol's address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      // Delete the anonymous expression module from the JIT.
+      TheJIT->removeModule(H);
+
       FnIR->print(llvm::errs());
       // flush stderr
       fprintf(stderr, "\n");
 
       // Remove the anonymous expression.
-      FnIR->eraseFromParent();
+      // FnIR->eraseFromParent();
     }
   } else {
     getNextToken();
@@ -469,7 +518,14 @@ static void MainLoop() {
   }
 }
 
+
 int main() {
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
+
+  fprintf(stderr, "Text 2");
+
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 30;
@@ -479,8 +535,12 @@ int main() {
   fprintf(stderr, "READY> ");
   getNextToken();
 
+  TheJIT = std::make_unique<llvm::orc::KaleidoscopeJIT>();
+
+
+  InitializeModuleAndPassManager();
+
   // build the llvm context
-  InitializeModule();
 
   // Run the main "interpreter loop"
   MainLoop();
